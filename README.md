@@ -1,13 +1,16 @@
-# brb_node_qp2p
+# brb_node_snfs
 
 [MaidSafe website](http://maidsafe.net) | [Safe Network Forum](https://safenetforum.org/)
 :-------------------------------------: | :---------------------------------------------:
 
 ## About
 
-This crate implements a P2P node (CLI) for using BRB over Quic protocol via [qp2p](<https://github.com/maidsafe/qp2p>).
+This crate is an attempt to build an async P2P distributed filesystem.  This is work-in-progress research and nowhere near ready for any real use.
 
-Please see the [brb crate](https://github.com/maidsafe/brb/).
+Key components are:
+* [sn_fs](https://github.com/maidsafe/sn_fs/) - Safe Network filesystem library
+* [brb](https://github.com/maidsafe/brb/) - Byzantine reliable broadcast
+* [qp2p](https://github.com/maidsafe/qp2p/) - Quic protocol P2P library
 
 ## License
 
