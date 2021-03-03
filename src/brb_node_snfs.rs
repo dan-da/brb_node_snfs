@@ -1,16 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
 use cmdr::*;
 
 use log::{debug, error, info, trace, warn};
 //use std::io::Write;
-use std::path::Path;
-use std::ffi::OsStr;
 use std::env;
+use std::ffi::OsStr;
+use std::path::Path;
 
 use qp2p::{
     self, Config, DisconnectionEvents, Endpoint, IncomingConnections, IncomingMessages, QuicP2p,
@@ -22,13 +22,12 @@ use std::{
 
 use brb::membership::actor::ed25519::{Actor, Sig, SigningActor};
 use brb::{BRBDataType, DeterministicBRB, Packet as BRBPacket};
-use brb_dt_tree::BRBTree;
+use brb_dt_tree::{BRBTree, OpMoveTx};
 use crdt_tree::Clock;
 use openat::{Dir, SimpleType};
 use std::ffi::OsString;
 
-
-use sn_fs::{SnFs, FsTreeStore, FsOpMove, FsClock, FsTreeNode, TreeIdType, TreeMetaType};
+use sn_fs::{FsClock, FsOpMove, FsTreeNode, FsTreeStore, SnFs, TreeIdType, TreeMetaType};
 
 //type TypeId = u64;
 //type TypeMeta<'a> = &'static str;
@@ -45,31 +44,98 @@ struct SharedBRB {
     clock: Clock<Actor>,
 }
 
+#[derive(Debug, Clone)]
 struct FsBrbTreeStore {
     state: SharedBRB,
-    network_tx: mpsc::Sender<RouterCmd>,
+    network_tx: Arc<Mutex<mpsc::Sender<RouterCmd>>>,
+    pending_ops: Arc<Mutex<VecDeque<OpMoveTx<TreeIdType, TreeMetaType, Actor>>>>,
 }
 
 impl FsBrbTreeStore {
     fn new(state: SharedBRB, network_tx: mpsc::Sender<RouterCmd>) -> Self {
-        Self { state, network_tx }
+        let s = Self {
+            state,
+            network_tx: Arc::new(Mutex::new(network_tx)),
+            pending_ops: Arc::new(Mutex::new(Default::default())),
+        };
+
+        // spawn a thread for sending ops to network in sequence.
+        let c = s.clone();
+        std::thread::spawn(move || Self::exec_ops_when_ready(c));
+
+        s
+    }
+
+    fn exec_ops_when_ready(self) {
+        debug!("[CLI] entering exec_ops_when_ready");
+
+        loop {
+            // Wait until there are no BRB ops from our actor in flight. (pending supermajority).
+            loop {
+                let packets_to_resend = self.state.resend_pending_msgs();
+                if packets_to_resend.is_empty() {
+                    break;
+                }
+
+                // fixme: We should periodically ( 30 secs?  60 secs? ) resend these packets in best
+                //        effort to reach supermajority.
+
+                // ... re-send pending packets
+                // for p in packets_to_resend {
+                //     self.network_tx.send(RouterCmd::Deliver(p)).expect("Failed to queue packet");
+                // }
+
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+
+            let op_option = {
+                // fixme; unwrap()
+                let mut pending_ops = self.pending_ops.lock().unwrap();
+                pending_ops.pop_front()
+            }; // Mutex guard drops out of scope here.
+
+            if let Some(op) = op_option {
+                // exec the op.  (generate packets for sending op to peers)
+                let packets = self.state.exec_op(op);
+                debug!("exec_op() returned packets: {:?}", packets);
+
+                // Send/deliver packets to peers.
+                let guard = self.network_tx.lock().unwrap(); // fixme: unwrap
+                for packet in packets {
+                    guard
+                        .send(RouterCmd::Deliver(packet))
+                        .expect("Failed to queue packet");
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
     }
 }
 
 impl FsTreeStore for FsBrbTreeStore {
-    
     fn opmove(&self, parent_id: TreeIdType, meta: TreeMetaType, child_id: TreeIdType) -> FsOpMove {
         self.state.opmove(parent_id, meta, child_id)
+    }
 
+    fn opmoves(&self, ops: Vec<(TreeIdType, TreeMetaType, TreeIdType)>) -> Vec<FsOpMove> {
+        self.state.opmovetx_multi(ops)
     }
 
     fn apply_op(&mut self, op: FsOpMove) {
+        self.apply_ops(vec![op])
+    }
 
-        for packet in self.state.exec_op(op.clone()) {
-            self.network_tx.send(RouterCmd::Deliver(packet)).expect("Failed to queue packet");
-        }
+    fn apply_ops(&mut self, ops: Vec<FsOpMove>) {
+        self.state.apply_op(ops.clone());
 
-        self.state.apply_op(op);
+        debug!("[CLI] Adding op to pending_ops queue {:?}", ops);
+
+        let mut pending_ops = self.pending_ops.lock().unwrap();
+        pending_ops.push_back(ops);
+
+        // note: the op is added to a queue, which the
+        // exec_ops_when_ready() thread reads from
     }
 
     fn find(&self, child_id: &TreeIdType) -> Option<FsTreeNode> {
@@ -89,7 +155,6 @@ impl FsTreeStore for FsBrbTreeStore {
     }
 }
 
-
 impl SharedBRB {
     fn new() -> Self {
         let brb = BRB::new();
@@ -101,21 +166,23 @@ impl SharedBRB {
     }
 
     fn actor(&self) -> Actor {
-        self.brb.lock().unwrap().actor()
+        self.brb.lock().unwrap().actor() // fixme: unwrap
     }
 
     fn opmove(&self, parent_id: TreeIdType, meta: TreeMetaType, child_id: TreeIdType) -> FsOpMove {
-        self.brb.lock().unwrap().dt.opmove(parent_id, meta, child_id)
+        self.brb
+            .lock()
+            .unwrap() // fixme: unwrap
+            .dt
+            .opmove(parent_id, meta, child_id)
     }
 
-/*    
-    fn opmove(&mut self, parent_id: TreeIdType, meta: TreeMetaType, child_id: TreeIdType) -> Vec<Packet> {
-        let op = { self.brb.lock().unwrap().dt.opmove(parent_id, meta, child_id) }; // wrap to release the after op
-        self.exec_op(op)
+    fn opmovetx_multi(&self, ops: Vec<(TreeIdType, TreeMetaType, TreeIdType)>) -> Vec<FsOpMove> {
+        self.brb.lock().unwrap().dt.opmovetx_multi(ops) // fixme: unwrap
     }
-*/
 
     fn peers(&self) -> BTreeSet<Actor> {
+        // fixme: unwrap
         self.brb.lock().unwrap().peers().unwrap_or_else(|err| {
             error!("[CLI] Failure while reading brb peers: {:?}", err);
             Default::default()
@@ -123,17 +190,19 @@ impl SharedBRB {
     }
 
     fn trust_peer(&mut self, peer: Actor) {
+        // fixme: unwrap
         self.brb.lock().unwrap().force_join(peer);
     }
 
     fn untrust_peer(&mut self, peer: Actor) {
+        // fixme: unwrap
         self.brb.lock().unwrap().force_leave(peer);
     }
 
     fn request_join(&mut self, actor: Actor) -> Vec<Packet> {
         self.brb
             .lock()
-            .unwrap()
+            .unwrap() // fixme: unwrap
             .request_membership(actor)
             .unwrap_or_else(|err| {
                 error!("[CLI] Failed to request join for {:?} : {:?}", actor, err);
@@ -144,7 +213,7 @@ impl SharedBRB {
     fn request_leave(&mut self, actor: Actor) -> Vec<Packet> {
         self.brb
             .lock()
-            .unwrap()
+            .unwrap() // fixme: unwrap
             .kill_peer(actor)
             .unwrap_or_else(|err| {
                 error!("[CLI] Failed to request leave for {:?}: {:?}", actor, err);
@@ -153,6 +222,7 @@ impl SharedBRB {
     }
 
     fn anti_entropy(&mut self, peer: Actor) -> Option<Packet> {
+        // fixme: unwrap
         match self.brb.lock().unwrap().anti_entropy(peer) {
             Ok(packet) => Some(packet),
             Err(err) => {
@@ -163,6 +233,7 @@ impl SharedBRB {
     }
 
     fn exec_op(&self, op: <State as BRBDataType<Actor>>::Op) -> Vec<Packet> {
+        // fixme: unwrap
         self.brb.lock().unwrap().exec_op(op).unwrap_or_else(|err| {
             error!("[CLI] Error executing datatype op: {:?}", err);
             Default::default()
@@ -170,10 +241,12 @@ impl SharedBRB {
     }
 
     fn apply_op(&mut self, op: <State as BRBDataType<Actor>>::Op) {
+        // fixme: unwrap
         self.brb.lock().unwrap().dt.apply(op)
     }
 
     fn apply_packet(&mut self, packet: Packet) -> Vec<Packet> {
+        // fixme: unwrap
         match self.brb.lock().unwrap().handle_packet(packet) {
             Ok(packets) => packets,
             Err(e) => {
@@ -183,21 +256,58 @@ impl SharedBRB {
         }
     }
 
+    pub fn resend_pending_msgs(&self) -> Vec<Packet> {
+        // fixme: unwrap
+        match self.brb.lock().unwrap().resend_pending_msgs() {
+            Ok(packets) => packets,
+            Err(e) => {
+                error!("[CLI] resend_pending_deliveries failed: {:?}", e);
+                Default::default()
+            }
+        }
+    }
+
     fn find(&self, child_id: &TreeIdType) -> Option<FsTreeNode> {
-        self.brb.lock().unwrap().dt.treestate().tree().find(child_id).cloned()
+        self.brb
+            .lock()
+            .unwrap() // fixme: unwrap
+            .dt
+            .treestate()
+            .tree()
+            .find(child_id)
+            .cloned()
     }
 
     fn children(&self, parent_id: &TreeIdType) -> Vec<TreeIdType> {
-        self.brb.lock().unwrap().dt.treestate().tree().children(parent_id)
+        self.brb
+            .lock()
+            .unwrap() // fixme: unwrap
+            .dt
+            .treestate()
+            .tree()
+            .children(parent_id)
     }
 
     fn read(&self) -> String {
+        // fixme: unwrap
         format!("{}", self.brb.lock().unwrap().dt.treestate().tree())
     }
 
     fn time(&self) -> FsClock {
+        // fixme: unwrap
         self.brb.lock().unwrap().dt.treereplica().time().clone()
     }
+
+    // fn op_applied(&self, op: &FsOpMove) -> bool {
+    //     let guard = self.brb.lock().unwrap();
+    //     let log = guard.dt.treestate().log();
+    //     for o in log {
+    //         if o.clone().op_into() == *op {
+    //             return true;
+    //         }
+    //     }
+    //     false
+    // }
 
     fn truncate_log(&self) -> bool {
         false
@@ -329,27 +439,6 @@ impl Repl {
             .expect("Failed to queue router cmd");
         Ok(Action::Done)
     }
-/*
-    #[cmd]
-    fn mv(&mut self, args: &[String]) -> CommandResult {
-        if args.len() < 3 {
-            println!("help: mv <parent> <meta> <child>");
-            return Ok(Action::Done);
-        } 
-
-        let parent_id = args[0].parse::<TreeIdType>().unwrap();
-        let meta = args[1].parse::<TreeMetaType>().unwrap();
-        let child_id = args[2].parse::<TreeIdType>().unwrap();
-
-        for packet in self.state.opmove_exec(parent_id, meta, child_id) {
-            self.network_tx
-                .send(RouterCmd::Deliver(packet))
-                .expect("Failed to queue packet");
-        }
-
-        Ok(Action::Done)
-    }
-*/
 
     #[cmd]
     fn read(&mut self, _args: &[String]) -> CommandResult {
@@ -422,6 +511,7 @@ impl Router {
         )
         .expect("Error creating QuicP2p object");
 
+        // fixme: unwrap
         let epmeta = qp2p.new_endpoint().await.unwrap();
         let endpoint_info = EndpointInfo {
             shared_endpoint: epmeta.0,
@@ -472,12 +562,14 @@ impl Router {
 
     async fn listen_for_cmds(mut self, net_rx: Arc<TokioMutex<mpsc::Receiver<RouterCmd>>>) {
         loop {
+            // fixme: unwrap
             let net_cmd = net_rx.lock().await.recv().unwrap();
             self.apply(net_cmd).await;
         }
     }
 
     async fn deliver_network_msg(&mut self, network_msg: &NetworkMsg, dest_addr: &SocketAddr) {
+        // fixme: unwrap
         let msg = bincode::serialize(&network_msg).unwrap();
 
         if let Err(e) = self.endpoint.connect_to(&dest_addr).await {
@@ -653,7 +745,6 @@ impl Router {
     }
 }
 
-
 async fn listen_for_network_msgs(
     mut endpoint_info: EndpointInfo,
     router_tx: mpsc::Sender<RouterCmd>,
@@ -663,10 +754,10 @@ async fn listen_for_network_msgs(
 
     router_tx
         .send(RouterCmd::SayHello(listen_addr))
-//        .await
         .expect("Failed to send command to add self as peer");
 
     while let Some((socket_addr, bytes)) = endpoint_info.incoming_messages.next().await {
+        // fixme: unwrap
         let net_msg: NetworkMsg = bincode::deserialize(&bytes).unwrap();
 
         let msg = format!("[P2P] received from {:?} --> {:?}", socket_addr, net_msg);
@@ -681,42 +772,13 @@ async fn listen_for_network_msgs(
             NetworkMsg::Ack(packet) => RouterCmd::Acked(packet),
         };
 
-        router_tx
-            .send(cmd)
-//            .await
-            .expect("Failed to send router command");
+        router_tx.send(cmd).expect("Failed to send router command");
     }
 
     info!("[P2P] Finished listening for incoming messages");
 }
 
-/*
-async fn send_to_router(router_tx: mpsc::Sender<RouterCmd>)
-{
-
-    std::thread::sleep(std::time::Duration::from_secs(5));
-
-    debug!("Sending Debug cmd to router");
-
-    router_tx
-            .send(RouterCmd::Debug)
-//            .await
-            .expect("Failed to queue router cmd");
-    
-    debug!("Sent Debug cmd to router.   Sleeping 5.");
-
-//    std::thread::sleep(std::time::Duration::from_secs(5));
-    tokio::time::delay_for(tokio::time::Duration::from_secs(5)).await;
-
-    debug!("send_to_router thread exiting");
-}
-*/
-
-async fn listen_for_fuse_events(
-    store: FsBrbTreeStore,
-    mountpoint: OsString
-) {
-
+async fn listen_for_fuse_events(store: FsBrbTreeStore, mountpoint: OsString) {
     // We use Dir::open() to get access to the mountpoint directory
     // before the mount occurs.  This handle enables us to later create/write/read
     // "real" files beneath the mountpoint even though other processes will only
@@ -729,9 +791,6 @@ async fn listen_for_fuse_events(
         }
     };
 
-    // Actor is ed25519 Public Key
-    // let actor = SigningActor::default().actor();
-
     // Notes:
     //  1. todo: these options should come from command line.
     //  2. allow_other enables other users to read/write.  Required for testing chown.
@@ -742,12 +801,10 @@ async fn listen_for_fuse_events(
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();
 
-//    let replica = FsTreeReplicaStore::new(actor);
-
     // mount the filesystem.
     let filecontent_on_disk = false;
     let sn_fs = SnFs::<FsBrbTreeStore>::new(store, mountpoint_fd, filecontent_on_disk);
-    if let Err(e) = fuse::mount(sn_fs, &mountpoint.clone(), &options) {
+    if let Err(e) = fuse::mount(sn_fs, &mountpoint, &options) {
         eprintln!("Mount failed.  {:?}", e);
         return;
     }
@@ -755,7 +812,7 @@ async fn listen_for_fuse_events(
     // Delete all "real" files (each file representing content of 1 inode) under mount point.
     // this code should be in SnFs::destroy(), but its not getting called.
     // Seems like a fuse bug/issue.
-    let mountpoint_fd = Dir::open(Path::new(&mountpoint)).unwrap();
+    let mountpoint_fd = Dir::open(Path::new(&mountpoint)).unwrap(); // fixme: unwrap
     if let Ok(entries) = mountpoint_fd.list_dir(".") {
         for result in entries {
             if let Ok(entry) = result {
@@ -773,14 +830,14 @@ async fn listen_for_fuse_events(
     warn!("Filesystem unmounted.  FUSE thread exiting!");
 }
 
-
 #[tokio::main]
 async fn main() {
     // Customize logger to:
     //  1. display messages from brb crates only.  (filter)
     //  2. omit timestamp, etc.  display each log message string + newline.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
-        "brb=debug,brb_membership=debug,brb_dt_orswot=debug,brb_node=debug,qp2p=warn,quinn=warn",
+//        "brb=debug,brb_membership=debug,brb_dt_orswot=debug,brb_node=debug,sn_fs=debug,qp2p=warn,quinn=warn",
+        "brb=info,brb_membership=info,brb_dt_orswot=info,brb_node=debug,sn_fs=debug,qp2p=warn,quinn=warn",
     ))
 //    .format(|buf, record| writeln!(buf, "{}\n", record.args()))
     .init();
@@ -799,11 +856,12 @@ async fn main() {
 
     let router_rx_arc = Arc::new(TokioMutex::new(router_rx));
 
-//    tokio::spawn(send_to_router(router_tx.clone()));
     tokio::spawn(listen_for_network_msgs(endpoint_info, router_tx.clone()));
-//    tokio::spawn(router.listen_for_cmds(router_rx));
-    tokio::spawn(router.listen_for_cmds(router_rx_arc.clone()));
-    tokio::spawn(listen_for_fuse_events(FsBrbTreeStore::new(state.clone(), router_tx.clone()), mountpoint));
+    tokio::spawn(router.listen_for_cmds(router_rx_arc));
+    tokio::spawn(listen_for_fuse_events(
+        FsBrbTreeStore::new(state.clone(), router_tx.clone()),
+        mountpoint,
+    ));
 
     // Delay by 1 second to prevent P2P startup from overwriting user prompt.
     std::thread::sleep(std::time::Duration::from_secs(1));
