@@ -66,16 +66,24 @@ impl FsBrbTreeStore {
         s
     }
 
+    // This fn is a thread that reads ops from self.pending_ops queue and broadcasts them
+    // to the peers once it is ok to do so... i.e. once a supermajority of peers tell our
+    // node that they have received ProofOfAgreement for the previous op.
     fn exec_ops_when_ready(self) {
         debug!("[CLI] entering exec_ops_when_ready");
 
+        // We process one op per iteration of this loop.
         loop {
             // Wait until there are no BRB ops from our actor in flight. (pending supermajority).
             loop {
-                let packets_to_resend = self.state.resend_pending_msgs();
-                if packets_to_resend.is_empty() {
+                if !self.state.has_pending_source_op() {
                     break;
                 }
+
+                // let packets_to_resend = self.state.resend_pending_msgs();
+                // if packets_to_resend.is_empty() {
+                //     break;
+                // }
 
                 // fixme: We should periodically ( 30 secs?  60 secs? ) resend these packets in best
                 //        effort to reach supermajority.
@@ -85,9 +93,10 @@ impl FsBrbTreeStore {
                 //     self.network_tx.send(RouterCmd::Deliver(p)).expect("Failed to queue packet");
                 // }
 
-                std::thread::sleep(std::time::Duration::from_millis(30));
+                std::thread::sleep(std::time::Duration::from_millis(60));
             }
 
+            // Get next pending op.  Do it quickly to keep lock contention low.
             let op_option = {
                 // fixme; unwrap()
                 let mut pending_ops = self.pending_ops.lock().unwrap();
@@ -108,7 +117,7 @@ impl FsBrbTreeStore {
                 }
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::thread::sleep(std::time::Duration::from_millis(60));
         }
     }
 }
@@ -256,6 +265,7 @@ impl SharedBRB {
         }
     }
 
+    #[allow(dead_code)]
     pub fn resend_pending_msgs(&self) -> Vec<Packet> {
         // fixme: unwrap
         match self.brb.lock().unwrap().resend_pending_msgs() {
@@ -265,6 +275,12 @@ impl SharedBRB {
                 Default::default()
             }
         }
+    }
+
+    pub fn has_pending_source_op(&self) -> bool {
+        // fixme: unwrap
+        let brb = self.brb.lock().unwrap();
+        !brb.pending_delivery.is_empty() || !brb.pending_proof.is_empty()
     }
 
     fn find(&self, child_id: &TreeIdType) -> Option<FsTreeNode> {
@@ -478,7 +494,6 @@ enum RouterCmd {
     AddPeer(Actor, SocketAddr),
     Deliver(Packet),
     Apply(Packet),
-    Acked(Packet),
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -486,7 +501,6 @@ enum RouterCmd {
 enum NetworkMsg {
     Peer(Actor, SocketAddr),
     Packet(Packet),
-    Ack(Packet),
 }
 
 #[allow(dead_code)]
@@ -577,14 +591,10 @@ impl Router {
             return;
         }
 
-        let logmsg = format!(
+        debug!(
             "[P2P] Sending message to {:?} --> {:?}",
             dest_addr, network_msg
         );
-        match network_msg {
-            NetworkMsg::Ack(_) => trace!("{}", logmsg),
-            _ => debug!("{}", logmsg),
-        }
 
         match self.endpoint.send_message(msg.into(), &dest_addr).await {
             Ok(()) => trace!("[P2P] Sent network msg successfully."),
@@ -599,7 +609,7 @@ impl Router {
                     "[P2P] delivering packet to {:?} at addr {:?}: {:?}",
                     packet.dest, peer_addr, packet
                 );
-                self.unacked_packets.push_back(packet.clone());
+//                self.unacked_packets.push_back(packet.clone());
                 self.deliver_network_msg(&NetworkMsg::Packet(packet), &peer_addr)
                     .await;
             }
@@ -611,11 +621,7 @@ impl Router {
     }
 
     async fn apply(&mut self, cmd: RouterCmd) {
-        let logmsg = format!("[P2P] router cmd {:?}", cmd);
-        match cmd {
-            RouterCmd::Acked(_) => trace!("{}", logmsg),
-            _ => debug!("{}", logmsg),
-        }
+        debug!("[P2P] router cmd {:?}", cmd);
 
         match cmd {
             RouterCmd::Retry => {
@@ -715,31 +721,6 @@ impl Router {
                 for packet in self.state.apply_packet(op_packet.clone()) {
                     self.deliver_packet(packet).await;
                 }
-
-                if let Some(peer_addr) = self.peers.clone().get(&op_packet.source) {
-                    trace!(
-                        "[P2P] delivering Ack(packet) to {:?} at addr {:?}: {:?}",
-                        op_packet.dest,
-                        peer_addr,
-                        op_packet
-                    );
-                    self.deliver_network_msg(&NetworkMsg::Ack(op_packet), &peer_addr)
-                        .await;
-                } else {
-                    warn!(
-                        "[P2P] we don't have a peer matching the destination for packet {:?}",
-                        op_packet
-                    );
-                }
-            }
-            RouterCmd::Acked(packet) => {
-                self.unacked_packets
-                    .iter()
-                    .position(|p| p == &packet)
-                    .map(|idx| {
-                        trace!("[P2P] Got ack for packet {:?}", packet);
-                        self.unacked_packets.remove(idx)
-                    });
             }
         }
     }
@@ -756,20 +737,16 @@ async fn listen_for_network_msgs(
         .send(RouterCmd::SayHello(listen_addr))
         .expect("Failed to send command to add self as peer");
 
-    while let Some((socket_addr, bytes)) = endpoint_info.incoming_messages.next().await {
+//    while let Some((socket_addr, bytes)) = futures::executor::block_on(endpoint_info.incoming_messages.next()) {  // sync version
+    while let Some((socket_addr, bytes)) = endpoint_info.incoming_messages.next().await {  // async version
         // fixme: unwrap
         let net_msg: NetworkMsg = bincode::deserialize(&bytes).unwrap();
 
-        let msg = format!("[P2P] received from {:?} --> {:?}", socket_addr, net_msg);
-        match net_msg {
-            NetworkMsg::Ack(_) => trace!("{}", msg),
-            _ => debug!("{}", msg),
-        }
+        debug!("[P2P] received from {:?} --> {:?}", socket_addr, net_msg);
 
         let cmd = match net_msg {
             NetworkMsg::Peer(actor, addr) => RouterCmd::AddPeer(actor, addr),
             NetworkMsg::Packet(packet) => RouterCmd::Apply(packet),
-            NetworkMsg::Ack(packet) => RouterCmd::Acked(packet),
         };
 
         router_tx.send(cmd).expect("Failed to send router command");
@@ -837,7 +814,8 @@ async fn main() {
     //  2. omit timestamp, etc.  display each log message string + newline.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
 //        "brb=debug,brb_membership=debug,brb_dt_orswot=debug,brb_node=debug,sn_fs=debug,qp2p=warn,quinn=warn",
-        "brb=info,brb_membership=info,brb_dt_orswot=info,brb_node=debug,sn_fs=debug,qp2p=warn,quinn=warn",
+        "brb=trace,brb_membership=trace,brb_dt_orswot=trace,brb_node=trace,sn_fs=trace,qp2p=warn,quinn=warn",
+//        "brb=info,brb_membership=info,brb_dt_orswot=info,brb_node=debug,sn_fs=debug,qp2p=warn,quinn=warn",
     ))
 //    .format(|buf, record| writeln!(buf, "{}\n", record.args()))
     .init();
@@ -857,6 +835,11 @@ async fn main() {
     let router_rx_arc = Arc::new(TokioMutex::new(router_rx));
 
     tokio::spawn(listen_for_network_msgs(endpoint_info, router_tx.clone()));
+
+    // non tokio version of above.  seems to make BRB comms a bit faster, but unverified.
+    // let rtx = router_tx.clone();
+    // std::thread::spawn(move || listen_for_network_msgs(endpoint_info, rtx));
+
     tokio::spawn(router.listen_for_cmds(router_rx_arc));
     tokio::spawn(listen_for_fuse_events(
         FsBrbTreeStore::new(state.clone(), router_tx.clone()),
