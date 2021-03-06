@@ -478,6 +478,7 @@ struct Router {
     endpoint: Endpoint,
     peers: HashMap<Actor, SocketAddr>,
     unacked_packets: VecDeque<Packet>,
+    auto_join: bool, // If true, we perform actions to automatically establish (or join) BRB voting group.
 }
 
 #[derive(Debug)]
@@ -542,6 +543,7 @@ impl Router {
             endpoint: endpoint_info.shared_endpoint.clone(),
             peers: Default::default(),
             unacked_packets: Default::default(),
+            auto_join: true,
         };
 
         (router, endpoint_info)
@@ -609,7 +611,7 @@ impl Router {
                     "[P2P] delivering packet to {:?} at addr {:?}: {:?}",
                     packet.dest, peer_addr, packet
                 );
-//                self.unacked_packets.push_back(packet.clone());
+                //                self.unacked_packets.push_back(packet.clone());
                 self.deliver_network_msg(&NetworkMsg::Packet(packet), &peer_addr)
                     .await;
             }
@@ -617,6 +619,54 @@ impl Router {
                 "[P2P] we don't have a peer matching the destination for packet {:?}",
                 packet
             ),
+        }
+    }
+
+    // Note: I'm having difficulty getting this thread to build/run
+    // due to rust ownership issues.  For now we just run
+    // anti_entropy once 2 seconds after trusting peer and that
+    // works well enough for initial (small) sync via localhost.
+    //
+    // Leaving this here to come back to later.
+
+    // async fn anti_entropy_thread(mut self, actor: Actor) {
+
+    //     std::thread::sleep(std::time::Duration::from_secs(1));
+
+    //     loop {
+
+    //         self.anti_entropy(actor.to_string()).await;
+
+    //         debug!("anti_entropy thread going to sleep");
+    //         std::thread::sleep(std::time::Duration::from_secs(60));
+    //         debug!("anti_entropy thread wakeup after sleep");
+    //     }
+
+    //     // info!("anti_entropy thread finished.  exiting.");
+    // }
+
+    async fn anti_entropy(&mut self, actor_id: String) {
+        if let Some(actor) = self.resolve_actor(&actor_id) {
+            info!("[P2P] Starting anti-entropy with actor: {:?}", actor);
+            if let Some(packet) = self.state.anti_entropy(actor) {
+                self.deliver_packet(packet).await;
+            }
+        }
+    }
+
+    async fn request_join(&mut self, actor_id: String) {
+        if let Some(actor) = self.resolve_actor(&actor_id) {
+            info!("[P2P] Starting join for actor: {:?}", actor);
+            for packet in self.state.request_join(actor) {
+                self.deliver_packet(packet).await;
+            }
+        }
+    }
+
+    fn trust(&mut self, actor_id: String) {
+        if let Some(actor) = self.resolve_actor(&actor_id) {
+            info!("[P2P] Trusting actor: {:?}", actor);
+            self.state.trust_peer(actor);
         }
     }
 
@@ -636,12 +686,7 @@ impl Router {
                 debug!("{:#?}", self);
             }
             RouterCmd::AntiEntropy(actor_id) => {
-                if let Some(actor) = self.resolve_actor(&actor_id) {
-                    info!("[P2P] Starting anti-entropy with actor: {:?}", actor);
-                    if let Some(packet) = self.state.anti_entropy(actor) {
-                        self.deliver_packet(packet).await;
-                    }
-                }
+                self.anti_entropy(actor_id).await;
             }
             RouterCmd::ListPeers => {
                 let voting_peers = self.state.peers();
@@ -672,12 +717,7 @@ impl Router {
                 }
             }
             RouterCmd::RequestJoin(actor_id) => {
-                if let Some(actor) = self.resolve_actor(&actor_id) {
-                    info!("[P2P] Starting join for actor: {:?}", actor);
-                    for packet in self.state.request_join(actor) {
-                        self.deliver_packet(packet).await;
-                    }
-                }
+                self.request_join(actor_id).await;
             }
             RouterCmd::RequestLeave(actor_id) => {
                 if let Some(actor) = self.resolve_actor(&actor_id) {
@@ -688,10 +728,7 @@ impl Router {
                 }
             }
             RouterCmd::Trust(actor_id) => {
-                if let Some(actor) = self.resolve_actor(&actor_id) {
-                    info!("[P2P] Trusting actor: {:?}", actor);
-                    self.state.trust_peer(actor);
-                }
+                self.trust(actor_id);
             }
             RouterCmd::Untrust(actor_id) => {
                 if let Some(actor) = self.resolve_actor(&actor_id) {
@@ -703,8 +740,7 @@ impl Router {
                 self.deliver_network_msg(&NetworkMsg::Peer(self.state.actor(), self.addr), &addr)
                     .await
             }
-            RouterCmd::AddPeer(actor, addr) =>
-            {
+            RouterCmd::AddPeer(actor, addr) => {
                 #[allow(clippy::map_entry)]
                 if !self.peers.contains_key(&actor) {
                     for (peer_actor, peer_addr) in self.peers.clone().iter() {
@@ -712,6 +748,27 @@ impl Router {
                             .await;
                     }
                     self.peers.insert(actor, addr);
+
+                    if self.auto_join {
+                        if actor == self.state.actor() {
+                        }
+                        // if we are voting member and peer is not, then we sponsor him
+                        else if self.state.peers().contains(&self.state.actor())
+                            && !self.state.peers().contains(&actor)
+                        {
+                            self.request_join(actor.to_string()).await;
+                        }
+                        // if we are not voting member and neither is any peer, then we trust peer.
+                        // fixme: should verify that we intend to join peer's group.
+                        else if !self.state.peers().contains(&self.state.actor())
+                            && self.state.peers().is_empty()
+                        {
+                            self.trust(actor.to_string());
+
+                            tokio::time::delay_for(std::time::Duration::from_secs(2)).await;
+                            self.anti_entropy(actor.to_string()).await;
+                        }
+                    }
                 }
             }
             RouterCmd::Deliver(packet) => {
@@ -737,8 +794,9 @@ async fn listen_for_network_msgs(
         .send(RouterCmd::SayHello(listen_addr))
         .expect("Failed to send command to add self as peer");
 
-//    while let Some((socket_addr, bytes)) = futures::executor::block_on(endpoint_info.incoming_messages.next()) {  // sync version
-    while let Some((socket_addr, bytes)) = endpoint_info.incoming_messages.next().await {  // async version
+    //    while let Some((socket_addr, bytes)) = futures::executor::block_on(endpoint_info.incoming_messages.next()) {  // sync version
+    while let Some((socket_addr, bytes)) = endpoint_info.incoming_messages.next().await {
+        // async version
         // fixme: unwrap
         let net_msg: NetworkMsg = bincode::deserialize(&bytes).unwrap();
 
@@ -846,11 +904,30 @@ async fn main() {
         mountpoint,
     ));
 
+    match env::args_os().nth(2) {
+        Some(arg) => match arg.to_string_lossy().to_string().parse::<SocketAddr>() {
+            Ok(addr) => {
+                info!("[CLI] parsed peer addr {:?}", addr);
+                router_tx
+                    .send(RouterCmd::SayHello(addr))
+                    .unwrap_or_else(|e| error!("[CLI] Failed to queue router command {:?}", e));
+            }
+            Err(e) => {
+                error!("[CLI] bad addr {:?}", e)
+            }
+        },
+        None => {
+            router_tx
+                .send(RouterCmd::Trust("me".to_string()))
+                .unwrap_or_else(|e| error!("[CLI] Failed to queue router command {:?}", e));
+        }
+    }
+
     // Delay by 1 second to prevent P2P startup from overwriting user prompt.
     std::thread::sleep(std::time::Duration::from_secs(1));
     cmd_loop(&mut Repl::new(state, router_tx)).expect("Failure in REPL");
 }
 
 fn print_usage() {
-    eprintln!("Usage: brb_node_snfs <mountpoint_path>");
+    eprintln!("Usage: brb_node_snfs <mountpoint_path> [ip:port]");
 }
