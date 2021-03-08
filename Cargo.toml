@@ -26,10 +26,10 @@ brb_dt_tree = {git="https://github.com/dan-da/brb_dt_tree.git", branch="multi_op
 sn_fs = {git="https://github.com/dan-da/sn_fs.git", branch="sn_fs_library_pr"}
 fuse = "0.3.1"
 openat = "0.1.19"
-qp2p = "0.9.18"
+qp2p = "0.10.0"
 brb = "1.0.7"
 
 
 [dependencies.tokio]
-version = "~0.2.25"
+version = "~1.2.0"
 features = [ "full", "time" ]
