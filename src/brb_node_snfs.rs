@@ -749,11 +749,9 @@ impl Router {
                     }
                     self.peers.insert(actor, addr);
 
-                    if self.auto_join {
-                        if actor == self.state.actor() {
-                        }
+                    if self.auto_join && actor != self.state.actor() {
                         // if we are voting member and peer is not, then we sponsor him
-                        else if self.state.peers().contains(&self.state.actor())
+                        if self.state.peers().contains(&self.state.actor())
                             && !self.state.peers().contains(&actor)
                         {
                             self.request_join(actor.to_string()).await;
