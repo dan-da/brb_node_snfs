@@ -26,8 +26,9 @@ brb_dt_tree = {git="https://github.com/dan-da/brb_dt_tree.git", branch="multi_op
 sn_fs = {git="https://github.com/dan-da/sn_fs.git", branch="sn_fs_library_pr"}
 fuse = "0.3.1"
 openat = "0.1.19"
-qp2p = "0.10.0"
+qp2p = "0.11.9"
 brb = "1.0.7"
+structopt = "0.3.21"
 
 
 [dependencies.tokio]

@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
+use structopt::StructOpt;
 
 use cmdr::*;
 
 use log::{debug, error, info, trace, warn};
 //use std::io::Write;
-use std::env;
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -17,7 +17,7 @@ use qp2p::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
 };
 
 use brb::membership::actor::ed25519::{Actor, Sig, SigningActor};
@@ -33,6 +33,19 @@ use sn_fs::{FsClock, FsOpMove, FsTreeNode, FsTreeStore, SnFs, TreeIdType, TreeMe
 //type TypeMeta<'a> = &'static str;
 //type Meta = u64;
 //type Actor = u64;
+
+/// Configuration for the program
+#[derive(Serialize, Deserialize, StructOpt)]
+pub struct NodeConfig {
+    /// Path to empty mount directory
+    mountpoint_path: OsString,
+
+    /// Peer address (IP:port)
+    peer_addr: Option<SocketAddr>,
+
+    #[structopt(flatten)]
+    quic_p2p_opts: Config,
+}
 
 type State = BRBTree<Actor, TreeIdType, TreeMetaType>;
 type BRB = DeterministicBRB<Actor, SigningActor, Sig, State>;
@@ -514,13 +527,11 @@ struct EndpointInfo {
 
 impl Router {
     async fn new(state: SharedBRB) -> (Self, EndpointInfo) {
+
+        let config = NodeConfig::from_args();
+
         let qp2p = QuicP2p::with_config(
-            Some(Config {
-                local_port: None,
-                local_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-                idle_timeout_msec: Some(1000 * 86400 * 365), // 1 year idle timeout.
-                ..Default::default()
-            }),
+            Some(config.quic_p2p_opts),
             Default::default(),
             true,
         )
@@ -865,6 +876,9 @@ async fn listen_for_fuse_events(store: FsBrbTreeStore, mountpoint: OsString) {
 
 #[tokio::main]
 async fn main() {
+
+    let config = NodeConfig::from_args();
+
     // Customize logger to:
     //  1. display messages from brb crates only.  (filter)
     //  2. omit timestamp, etc.  display each log message string + newline.
@@ -875,14 +889,6 @@ async fn main() {
     ))
 //    .format(|buf, record| writeln!(buf, "{}\n", record.args()))
     .init();
-
-    let mountpoint = match env::args_os().nth(1) {
-        Some(v) => v,
-        None => {
-            print_usage();
-            return;
-        }
-    };
 
     let state = SharedBRB::new();
     let (router, endpoint_info) = Router::new(state.clone()).await;
@@ -899,20 +905,14 @@ async fn main() {
     tokio::spawn(router.listen_for_cmds(router_rx_arc));
     tokio::spawn(listen_for_fuse_events(
         FsBrbTreeStore::new(state.clone(), router_tx.clone()),
-        mountpoint,
+        config.mountpoint_path,
     ));
 
-    match env::args_os().nth(2) {
-        Some(arg) => match arg.to_string_lossy().to_string().parse::<SocketAddr>() {
-            Ok(addr) => {
-                info!("[CLI] parsed peer addr {:?}", addr);
-                router_tx
-                    .send(RouterCmd::SayHello(addr))
-                    .unwrap_or_else(|e| error!("[CLI] Failed to queue router command {:?}", e));
-            }
-            Err(e) => {
-                error!("[CLI] bad addr {:?}", e)
-            }
+    match config.peer_addr {
+        Some(addr) => {
+            router_tx
+                .send(RouterCmd::SayHello(addr))
+                .unwrap_or_else(|e| error!("[CLI] Failed to queue router command {:?}", e));
         },
         None => {
             router_tx
@@ -924,8 +924,4 @@ async fn main() {
     // Delay by 1 second to prevent P2P startup from overwriting user prompt.
     std::thread::sleep(std::time::Duration::from_secs(1));
     cmd_loop(&mut Repl::new(state, router_tx)).expect("Failure in REPL");
-}
-
-fn print_usage() {
-    eprintln!("Usage: brb_node_snfs <mountpoint_path> [ip:port]");
 }
