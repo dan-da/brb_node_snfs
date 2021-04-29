@@ -533,7 +533,7 @@ impl Router {
         let qp2p = QuicP2p::with_config(
             Some(config.quic_p2p_opts),
             Default::default(),
-            true,
+            false,
         )
         .expect("Error creating QuicP2p object");
 
@@ -600,7 +600,7 @@ impl Router {
         let msg = bincode::serialize(&network_msg).unwrap();
 
         if let Err(e) = self.endpoint.connect_to(&dest_addr).await {
-            error!("[P2P] Failed to connect. {:?}", e);
+            error!("[P2P] Failed to connect to {}. {:?}", dest_addr, e);
             return;
         }
 
@@ -799,10 +799,6 @@ async fn listen_for_network_msgs(
     let listen_addr = endpoint_info.shared_endpoint.socket_addr();
     info!("[P2P] listening on {:?}", listen_addr);
 
-    router_tx
-        .send(RouterCmd::SayHello(listen_addr))
-        .expect("Failed to send command to add self as peer");
-
     //    while let Some((socket_addr, bytes)) = futures::executor::block_on(endpoint_info.incoming_messages.next()) {  // sync version
     while let Some((socket_addr, bytes)) = endpoint_info.incoming_messages.next().await {
         // async version
@@ -895,6 +891,10 @@ async fn main() {
     let (router_tx, router_rx) = mpsc::channel();
 
     let router_rx_arc = Arc::new(TokioMutex::new(router_rx));
+
+    router_tx
+        .send(RouterCmd::AddPeer(state.actor(), endpoint_info.shared_endpoint.socket_addr()))
+        .expect("Failed to send command to add self as peer");
 
     tokio::spawn(listen_for_network_msgs(endpoint_info, router_tx.clone()));
 
