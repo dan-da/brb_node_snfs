@@ -29,6 +29,7 @@ openat = "0.1.19"
 qp2p = "0.11.9"
 brb = "1.0.7"
 structopt = "0.3.21"
+futures = "0.3.14"
 
 
 [dependencies.tokio]

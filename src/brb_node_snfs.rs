@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 use structopt::StructOpt;
+use futures::executor::block_on;
 
 use cmdr::*;
 
@@ -587,12 +588,16 @@ impl Router {
         }
     }
 
-    async fn listen_for_cmds(mut self, net_rx: Arc<TokioMutex<mpsc::Receiver<RouterCmd>>>) {
+    async fn listen_for_cmd(mut self, net_rx: Arc<TokioMutex<mpsc::Receiver<RouterCmd>>>) {
         loop {
-            // fixme: unwrap
             let net_cmd = net_rx.lock().await.recv().unwrap();
             self.apply(net_cmd).await;
         }
+    }
+
+    fn listen_for_cmds(mut self, net_rx: Arc<TokioMutex<mpsc::Receiver<RouterCmd>>>) {
+        // fixme: unwrap
+        block_on(self.listen_for_cmd(net_rx));
     }
 
     async fn deliver_network_msg(&mut self, network_msg: &NetworkMsg, dest_addr: &SocketAddr) {
@@ -796,8 +801,9 @@ async fn listen_for_network_msgs(
     mut endpoint_info: EndpointInfo,
     router_tx: mpsc::Sender<RouterCmd>,
 ) {
-    let listen_addr = endpoint_info.shared_endpoint.socket_addr();
-    info!("[P2P] listening on {:?}", listen_addr);
+    let local_addr = endpoint_info.shared_endpoint.local_addr();
+    let external_addr = endpoint_info.shared_endpoint.socket_addr();
+    info!("[P2P] listening on local  {:?}, external: {:?}", local_addr, external_addr);
 
     //    while let Some((socket_addr, bytes)) = futures::executor::block_on(endpoint_info.incoming_messages.next()) {  // sync version
     while let Some((socket_addr, bytes)) = endpoint_info.incoming_messages.next().await {
@@ -818,7 +824,7 @@ async fn listen_for_network_msgs(
     info!("[P2P] Finished listening for incoming messages");
 }
 
-async fn listen_for_fuse_events(store: FsBrbTreeStore, mountpoint: OsString) {
+fn listen_for_fuse_events(store: FsBrbTreeStore, mountpoint: OsString) {
     // We use Dir::open() to get access to the mountpoint directory
     // before the mount occurs.  This handle enables us to later create/write/read
     // "real" files beneath the mountpoint even though other processes will only
@@ -902,11 +908,13 @@ async fn main() {
     // let rtx = router_tx.clone();
     // std::thread::spawn(move || listen_for_network_msgs(endpoint_info, rtx));
 
-    tokio::spawn(router.listen_for_cmds(router_rx_arc));
-    tokio::spawn(listen_for_fuse_events(
-        FsBrbTreeStore::new(state.clone(), router_tx.clone()),
-        config.mountpoint_path,
-    ));
+    // tokio::spawn(router.listen_for_cmds(router_rx_arc));
+    tokio::task::spawn_blocking(move || router.listen_for_cmds(router_rx_arc));
+    let s = state.clone();
+    let r = router_tx.clone();
+    let p = config.mountpoint_path.clone();
+    tokio::task::spawn_blocking(move || listen_for_fuse_events(
+                    FsBrbTreeStore::new(s, r), p, ));
 
     match config.peer_addr {
         Some(addr) => {
