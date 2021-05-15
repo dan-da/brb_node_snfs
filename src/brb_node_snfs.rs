@@ -595,32 +595,38 @@ impl Router {
         }
     }
 
-    fn listen_for_cmds(mut self, net_rx: Arc<TokioMutex<mpsc::Receiver<RouterCmd>>>) {
+    fn listen_for_cmds(self, net_rx: Arc<TokioMutex<mpsc::Receiver<RouterCmd>>>) {
         // fixme: unwrap
         block_on(self.listen_for_cmd(net_rx));
     }
 
     async fn deliver_network_msg(&mut self, network_msg: &NetworkMsg, dest_addr: &SocketAddr) {
+
+        // if delivering to self, use local addr rather than external to avoid
+        // potential hairpinning problems.
+        let addr = if *dest_addr == self.addr { self.endpoint.local_addr() } else { *dest_addr };
+
         // fixme: unwrap
         let msg = bincode::serialize(&network_msg).unwrap();
 
-        if let Err(e) = self.endpoint.connect_to(&dest_addr).await {
-            error!("[P2P] Failed to connect to {}. {:?}", dest_addr, e);
+        if let Err(e) = self.endpoint.connect_to(&addr).await {
+            error!("[P2P] Failed to connect to {}. {:?}", addr, e);
             return;
         }
 
         debug!(
             "[P2P] Sending message to {:?} --> {:?}",
-            dest_addr, network_msg
+            addr, network_msg
         );
 
-        match self.endpoint.send_message(msg.into(), &dest_addr).await {
+        match self.endpoint.send_message(msg.into(), &addr).await {
             Ok(()) => trace!("[P2P] Sent network msg successfully."),
             Err(e) => error!("[P2P] Failed to send network msg: {:?}", e),
         }
     }
 
     async fn deliver_packet(&mut self, packet: Packet) {
+
         match self.peers.clone().get(&packet.dest) {
             Some(peer_addr) => {
                 info!(
@@ -758,7 +764,10 @@ impl Router {
             }
             RouterCmd::AddPeer(actor, addr) => {
                 #[allow(clippy::map_entry)]
-                if !self.peers.contains_key(&actor) {
+                if self.peers.contains_key(&actor) {
+                    trace!("We already know about peer {:?}@{:?}. ignoring.", actor, addr)
+                } else {
+                    // Here we send our peer list back to the new peer.
                     for (peer_actor, peer_addr) in self.peers.clone().iter() {
                         self.deliver_network_msg(&NetworkMsg::Peer(*peer_actor, *peer_addr), &addr)
                             .await;
