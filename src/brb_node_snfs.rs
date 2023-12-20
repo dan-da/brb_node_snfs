@@ -24,7 +24,6 @@ use std::{
 use brb::membership::actor::ed25519::{Actor, Sig, SigningActor};
 use brb::{BRBDataType, DeterministicBRB, Packet as BRBPacket};
 use brb_dt_tree::{BRBTree, OpMoveTx};
-use crdt_tree::Clock;
 use openat::{Dir, SimpleType};
 use std::ffi::OsString;
 
@@ -55,7 +54,6 @@ type Packet = BRBPacket<Actor, Sig, <State as BRBDataType<Actor>>::Op>;
 #[derive(Debug, Clone)]
 struct SharedBRB {
     brb: Arc<Mutex<BRB>>,
-    clock: Clock<Actor>,
 }
 
 #[derive(Debug, Clone)]
@@ -181,10 +179,8 @@ impl FsTreeStore for FsBrbTreeStore {
 impl SharedBRB {
     fn new() -> Self {
         let brb = BRB::new();
-        let clock = Clock::new(brb.actor(), None);
         Self {
             brb: Arc::new(Mutex::new(brb)),
-            clock,
         }
     }
 
